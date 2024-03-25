@@ -61,20 +61,20 @@ def gumbel_softmax_sample(logits, temperature):
 def gumbel_softmax(logits, temperature, hard=False):
     """
     ST-gumple-softmax
-    input: [*, n_class]
-    return: flatten --> [*, n_class] an one-hot vector
+    param logits: (bs, latent_dim, categorical_dim)
+    return: (bs, latent_dim * categorical_dim); one-hot samples if hard
     """
-    y = gumbel_softmax_sample(logits, temperature)
-    
+    y = gumbel_softmax_sample(logits, temperature)  # (bs, latent_dim, categorical_dim)
     if not hard:
         return y.view(-1, latent_dim * categorical_dim)
 
     shape = y.size()
     _, ind = y.max(dim=-1)
-    y_hard = torch.zeros_like(y).view(-1, shape[-1])
-    y_hard.scatter_(1, ind.view(-1, 1), 1)
+    y_hard = torch.zeros_like(y).view(-1, shape[-1])  # (bs * latent_dim, categorical_dim)
+    y_hard.scatter_(1, ind.view(-1, 1), 1)  # one-hot version of y
     y_hard = y_hard.view(*shape)
-    # Set gradients w.r.t. y_hard gradients w.r.t. y
+
+    # Set gradients w.r.t. y_hard to gradients w.r.t. y
     y_hard = (y_hard - y).detach() + y
     return y_hard.view(-1, latent_dim * categorical_dim)
 
@@ -105,9 +105,13 @@ class VAE_gumbel(nn.Module):
         return self.sigmoid(self.fc6(h5))
 
     def forward(self, x, temp, hard):
-        q = self.encode(x.view(-1, 784))
+        """
+        param x: (bs, 1, 28, 28)
+        return: (bs, 784), (bs, latent_dim * categorical_dim)
+        """
+        q = self.encode(x.view(-1, 784))  # (bs, latent_dim * categorical_dim)
         q_y = q.view(q.size(0), latent_dim, categorical_dim)
-        z = gumbel_softmax(q_y, temp, hard)
+        z = gumbel_softmax(q_y, temp, hard)  # (bs, latent_dim * categorical_dim); one-hot samples if hard
         return self.decode(z), F.softmax(q_y, dim=-1).reshape(*q.size())
 
 
@@ -123,12 +127,13 @@ if args.cuda:
 optimizer = optim.Adam(model.parameters(), lr=1e-3)
 
 
-# Reconstruction + KL divergence losses summed over all elements and batch
 def loss_function(recon_x, x, qy):
-    BCE = F.binary_cross_entropy(recon_x, x.view(-1, 784), size_average=False) / x.shape[0]
+    # MC estimate of reconstruction accuracy
+    BCE = F.binary_cross_entropy(recon_x, x.view(-1, 784), reduction='none').sum(-1).mean()  # summed over 784, then averaged over bs
 
+    # compute KL analytically
     log_ratio = torch.log(qy * categorical_dim + 1e-20)
-    KLD = torch.sum(qy * log_ratio, dim=-1).mean()
+    KLD = torch.sum(qy * log_ratio, dim=-1).mean()  # summed over latent_dim * categorical_dim, then averaged over bs
 
     return BCE + KLD
 
@@ -141,11 +146,13 @@ def train(epoch):
         if args.cuda:
             data = data.cuda()
         optimizer.zero_grad()
-        recon_batch, qy = model(data, temp, args.hard)
+        recon_batch, qy = model(data, temp, args.hard)  # data: (bs, 1, 28, 28) -> (bs, 784), (bs, latent_dim * categorical_dim)
         loss = loss_function(recon_batch, data, qy)
         loss.backward()
         train_loss += loss.item() * len(data)
         optimizer.step()
+
+        # Anneal the temperature
         if batch_idx % 100 == 1:
             temp = np.maximum(temp * np.exp(-ANNEAL_RATE * batch_idx), temp_min)
 
@@ -186,14 +193,14 @@ def run():
         train(epoch)
         test(epoch)
 
-        M = 64 * latent_dim
+        M = 64 * latent_dim  # 64 latent samples generate 64 images
         np_y = np.zeros((M, categorical_dim), dtype=np.float32)
-        np_y[range(M), np.random.choice(categorical_dim, M)] = 1
+        np_y[range(M), np.random.choice(categorical_dim, M)] = 1  # one-hot latent categorical samples
         np_y = np.reshape(np_y, [M // latent_dim, latent_dim, categorical_dim])
-        sample = torch.from_numpy(np_y).view(M // latent_dim, latent_dim * categorical_dim)
+        sample = torch.from_numpy(np_y).view(M // latent_dim, latent_dim * categorical_dim)  # (64, latent_dim * categorical_dim)
         if args.cuda:
             sample = sample.cuda()
-        sample = model.decode(sample).cpu()
+        sample = model.decode(sample).cpu()  # (64, 28*28)
         save_image(sample.data.view(M // latent_dim, 1, 28, 28),
                    'data/sample_' + str(epoch) + '.png')
 
